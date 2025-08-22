@@ -18,7 +18,7 @@ if not wechat_webhook_url:
     raise ValueError("环境变量 WECHAT_WEBHOOK_URL 未设置，请在Github Actions中设置此变量！")
 
 # Firecrawl API Key
-firecrawl_api_key = os.getenv("FIRECRAWL_API_KEY")
+firecrawl_api_key = "fc-b0cb6a0d8fd441a9b3f5cae5d55eff6c" #os.getenv("FIRECRAWL_API_KEY")
 if not firecrawl_api_key:
     raise ValueError("环境变量 FIRECRAWL_API_KEY 未设置，请在Github Actions中设置此变量！")
 
@@ -74,142 +74,358 @@ def today_date():
 
 # 爬取网页正文 (用于 AI 分析，但不展示) - 使用Firecrawl
 def fetch_article_text(url, max_retries=3):
-    """增强版文章内容抓取函数，包含完整的错误处理和重试机制"""
+    """重构版文章内容抓取函数，解决404误判、速率限制和反爬机制问题"""
     
     # 定义需要重试的临时错误状态码
     RETRY_STATUS_CODES = {502, 503, 504, 520, 521, 522, 523, 524}
-    # 定义永久错误状态码
-    PERMANENT_ERROR_CODES = {400, 401, 403, 404, 410, 451}
+    # 定义永久错误状态码（移除404，因为可能是反爬机制）
+    PERMANENT_ERROR_CODES = {400, 401, 410, 451}
+    # 403和404可能是反爬，需要特殊处理
+    ANTI_CRAWLER_CODES = {403, 404}
     
-    def check_http_status(url):
-        """检查URL的HTTP状态码"""
-        try:
-            response = requests.head(url, timeout=10, allow_redirects=True, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    # 针对不同网站的特殊请求头配置
+    def get_site_specific_headers(url):
+        """根据网站返回特定的请求头"""
+        base_headers = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0'
+        }
+        
+        if 'wallstreetcn.com' in url:
+            base_headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': 'https://wallstreetcn.com/',
+                'Origin': 'https://wallstreetcn.com'
             })
-            return response.status_code
+        elif '36kr.com' in url:
+            base_headers.update({
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': 'https://36kr.com/',
+                'Origin': 'https://36kr.com'
+            })
+        elif 'eastmoney.com' in url:
+            base_headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+                'Referer': 'http://www.eastmoney.com/',
+                'Origin': 'http://www.eastmoney.com'
+            })
+        elif 'hket.com' in url:
+            base_headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': 'https://china.hket.com/',
+                'Origin': 'https://china.hket.com'
+            })
+        else:
+            base_headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        
+        return base_headers
+    
+    def smart_status_check(url):
+        """智能状态检查，区分真实错误和反爬机制"""
+        headers = get_site_specific_headers(url)
+        session = requests.Session()
+        
+        try:
+            # 先尝试HEAD请求
+            response = session.head(url, timeout=15, allow_redirects=True, headers=headers)
+            status_code = response.status_code
+            
+            # 如果HEAD请求返回405或其他错误，尝试GET请求
+            if status_code in [405, 501] or status_code >= 500:
+                response = session.get(url, timeout=15, headers=headers, stream=True)
+                status_code = response.status_code
+                response.close()
+            
+            return status_code
         except requests.exceptions.RequestException as e:
             print(f"⚠️ 无法检查URL状态: {url}, 错误: {e}")
             return None
+        finally:
+            session.close()
     
-    def is_error_page_content(text):
+    def is_error_page_content(text, url=""):
         """检查内容是否为错误页面"""
         if not text or len(text.strip()) < 50:
             return True
         
+        # 更精确的错误页面检测
         error_indicators = [
-            '404', 'not found', 'page not found', '页面不存在', '页面未找到',
-            '500', 'internal server error', '服务器错误', '内部错误',
-            '502', 'bad gateway', '网关错误',
-            '503', 'service unavailable', '服务不可用',
-            '504', 'gateway timeout', '网关超时',
+            'page not found', '页面不存在', '页面未找到', '页面丢失',
+            'internal server error', '服务器错误', '内部错误',
+            'bad gateway', '网关错误',
+            'service unavailable', '服务不可用',
+            'gateway timeout', '网关超时',
             'access denied', '访问被拒绝', '权限不足',
-            'forbidden', '禁止访问'
+            'forbidden', '禁止访问',
+            '请完成下列验证后继续', '按住左边按钮拖动完成上方拼图',  # 36氪验证码页面
+            'cloudflare', 'just a moment', 'checking your browser',  # Cloudflare保护页面
+            '验证码', 'captcha', '人机验证', '安全验证',
+            '403 forbidden', '404 not found', '500 internal server error',
+            '网站维护中', 'under maintenance', 'temporarily unavailable'
         ]
         
+        # 网站特定的错误检测
+        site_specific_errors = {
+            '36kr.com': ['请开启javascript', '需要验证', '滑动验证'],
+            'wallstreetcn.com': ['登录后查看', '会员专享', '订阅用户'],
+            'eastmoney.com': ['页面加载失败', '网络连接异常'],
+            'hket.com': ['內容未找到', '文章不存在']
+        }
+        
         text_lower = text.lower()
-        return any(indicator in text_lower for indicator in error_indicators)
+        
+        # 检查通用错误指示器
+        error_count = sum(1 for indicator in error_indicators if indicator in text_lower)
+        
+        # 检查网站特定错误
+        for domain, specific_errors in site_specific_errors.items():
+            if domain in url:
+                error_count += sum(1 for error in specific_errors if error in text_lower)
+        
+        # 检查内容质量
+        if len(text.strip()) < 100 and any(keyword in text_lower for keyword in ['error', '错误', '失败', 'failed']):
+            error_count += 1
+        
+        return error_count >= 2 or any(strong_indicator in text_lower for strong_indicator in [
+            'page not found', '页面不存在', '请完成下列验证后继续', '403 forbidden', '404 not found'
+        ])
     
-    # 首先检查URL的HTTP状态码
-    status_code = check_http_status(url)
-    if status_code:
-        if status_code in PERMANENT_ERROR_CODES:
+    def handle_rate_limit_error(error_msg):
+        """处理速率限制错误"""
+        if 'rate limit' in error_msg.lower():
+            # 从错误消息中提取等待时间
+            import re
+            wait_match = re.search(r'retry after (\d+)s', error_msg)
+            if wait_match:
+                wait_time = int(wait_match.group(1)) + 2  # 额外等待2秒
+                print(f"⏳ Firecrawl速率限制，等待 {wait_time} 秒后重试")
+                time.sleep(wait_time)
+                return True
+            else:
+                print(f"⏳ Firecrawl速率限制，等待 15 秒后重试")
+                time.sleep(15)
+                return True
+        return False
+    
+    # 智能状态检查（仅对可疑URL进行）
+    status_code = None
+    if any(domain in url for domain in ['wallstreetcn.com', '36kr.com', 'hket.com']):
+        status_code = smart_status_check(url)
+        if status_code and status_code in PERMANENT_ERROR_CODES:
             print(f"❌ URL返回永久错误状态码 {status_code}: {url}")
             return "（页面不存在或访问被拒绝）"
-        elif status_code in RETRY_STATUS_CODES:
-            print(f"⚠️ URL返回临时错误状态码 {status_code}: {url}，将进行重试")
-        elif status_code >= 400:
-            print(f"⚠️ URL返回错误状态码 {status_code}: {url}")
+        elif status_code and status_code in ANTI_CRAWLER_CODES:
+            print(f"⚠️ URL可能遇到反爬机制 (状态码 {status_code}): {url}，将尝试多种方法")
     
     # 开始重试循环
+    firecrawl_failed = False
     for attempt in range(max_retries):
         if attempt > 0:
-            wait_time = 2 ** attempt  # 指数退避
+            wait_time = min(2 ** attempt, 10)  # 最大等待10秒
             print(f"🔄 第 {attempt + 1} 次重试 (等待 {wait_time} 秒): {url}")
             time.sleep(wait_time)
         
-        # 尝试使用Firecrawl
-        try:
-            print(f"📰 正在使用Firecrawl爬取文章内容 (尝试 {attempt + 1}/{max_retries}): {url}")
-            
-            scrape_result = firecrawl_app.scrape(
-                url, 
-                formats=['markdown', 'html'],
-                only_main_content=True,
-                include_tags=['title', 'article', 'main', 'content'],
-                exclude_tags=['nav', 'footer', 'header', 'aside', 'script', 'style'],
-                timeout=30000,
-            )
-            
-            if scrape_result and hasattr(scrape_result, 'markdown'):
-                text = scrape_result.markdown
+        # 尝试使用Firecrawl（如果之前没有遇到速率限制）
+        if not firecrawl_failed:
+            try:
+                print(f"📰 正在使用Firecrawl爬取文章内容 (尝试 {attempt + 1}/{max_retries}): {url}")
                 
-                # 如果markdown内容为空，尝试使用HTML内容
-                if not text or len(text.strip()) < 50:
-                    if hasattr(scrape_result, 'html') and scrape_result.html:
-                        html_content = scrape_result.html
-                        text = re.sub(r'<[^>]+>', '', html_content)
-                        text = re.sub(r'\s+', ' ', text).strip()
+                # 添加随机延迟避免速率限制
+                if attempt > 0:
+                    import random
+                    delay = random.uniform(1, 3)
+                    time.sleep(delay)
                 
-                # 检查是否为错误页面内容
-                if is_error_page_content(text):
-                    print(f"⚠️ Firecrawl获取到错误页面内容: {url}")
-                    continue
+                # 根据网站优化Firecrawl配置
+                firecrawl_config = {
+                    'formats': ['markdown', 'html'],
+                    'only_main_content': True,
+                    'timeout': 45000,
+                    'wait_for': 3000,
+                }
                 
-                text = text[:1500] if text else ""
-                
-                if text and len(text.strip()) >= 50:
-                    print(f"✅ Firecrawl成功获取文章内容，长度: {len(text)} 字符")
-                    return text
+                # 网站特定配置
+                if 'wallstreetcn.com' in url:
+                    firecrawl_config.update({
+                        'include_tags': ['article', '.article-content', '.content', 'main', '.post-content'],
+                        'exclude_tags': ['nav', 'footer', 'header', 'aside', 'script', 'style', '.ad', '.advertisement'],
+                        'wait_for': 5000,
+                        'actions': [{'type': 'wait', 'milliseconds': 2000}]
+                    })
+                elif '36kr.com' in url:
+                    firecrawl_config.update({
+                        'include_tags': ['article', '.article-wrapper', '.content', '.kr-rich-text-wrapper'],
+                        'exclude_tags': ['nav', 'footer', 'header', 'aside', 'script', 'style', '.ad-container'],
+                        'wait_for': 4000,
+                        'actions': [{'type': 'wait', 'milliseconds': 3000}]
+                    })
+                elif 'eastmoney.com' in url:
+                    firecrawl_config.update({
+                        'include_tags': ['article', '.news-content', '.content', '#ContentBody'],
+                        'exclude_tags': ['nav', 'footer', 'header', 'aside', 'script', 'style', '.ad'],
+                        'wait_for': 3000
+                    })
+                elif 'hket.com' in url:
+                    firecrawl_config.update({
+                        'include_tags': ['article', '.article-content', '.content', '.post-content'],
+                        'exclude_tags': ['nav', 'footer', 'header', 'aside', 'script', 'style', '.ad'],
+                        'wait_for': 2000
+                    })
                 else:
-                    print(f"⚠️ Firecrawl获取的文章内容为空或过短: {url}")
-            else:
-                print(f"⚠️ Firecrawl未返回有效内容: {url}")
+                    firecrawl_config.update({
+                        'include_tags': ['article', 'main', '.content', '.post-content', '.article-content'],
+                        'exclude_tags': ['nav', 'footer', 'header', 'aside', 'script', 'style', '.ad']
+                    })
                 
-        except Exception as e:
-            error_msg = str(e)
-            if "404" in error_msg or "not found" in error_msg.lower():
-                print(f"❌ Firecrawl遇到404错误: {url}")
-                break  # 404错误不需要重试
-            elif any(code in error_msg for code in ['502', '503', '504']):
-                print(f"⚠️ Firecrawl遇到临时服务器错误: {url}，错误: {e}")
-                continue  # 临时错误，继续重试
-            else:
-                print(f"❌ Firecrawl爬取失败: {url}，错误: {e}")
+                scrape_result = firecrawl_app.scrape(url, **firecrawl_config)
+                
+                if scrape_result and hasattr(scrape_result, 'markdown'):
+                    text = scrape_result.markdown
+                    
+                    # 如果markdown内容为空，尝试使用HTML内容
+                    if not text or len(text.strip()) < 50:
+                        if hasattr(scrape_result, 'html') and scrape_result.html:
+                            html_content = scrape_result.html
+                            text = re.sub(r'<[^>]+>', '', html_content)
+                            text = re.sub(r'\s+', ' ', text).strip()
+                    
+                    # 检查是否为错误页面内容
+                    if is_error_page_content(text):
+                        print(f"⚠️ Firecrawl获取到错误页面内容: {url}")
+                        continue
+                    
+                    text = text[:1500] if text else ""
+                    
+                    if text and len(text.strip()) >= 50:
+                        print(f"✅ Firecrawl成功获取文章内容，长度: {len(text)} 字符")
+                        return text
+                    else:
+                        print(f"⚠️ Firecrawl获取的文章内容为空或过短: {url}")
+                else:
+                    print(f"⚠️ Firecrawl未返回有效内容: {url}")
+                    
+            except Exception as e:
+                error_msg = str(e)
+                
+                # 处理速率限制
+                if handle_rate_limit_error(error_msg):
+                    continue  # 重试当前尝试
+                
+                # 处理其他错误
+                if "rate limit" in error_msg.lower():
+                    print(f"⚠️ Firecrawl遇到速率限制，切换到备用方案: {url}")
+                    firecrawl_failed = True
+                elif "404" in error_msg and "wallstreetcn.com" not in url:
+                    print(f"❌ Firecrawl遇到404错误: {url}")
+                    break  # 非华尔街见闻的404错误才跳出
+                elif any(code in error_msg for code in ['502', '503', '504']):
+                    print(f"⚠️ Firecrawl遇到临时服务器错误: {url}，错误: {e}")
+                    continue  # 临时错误，继续重试
+                else:
+                    print(f"⚠️ Firecrawl爬取失败: {url}，错误: {e}")
+                    firecrawl_failed = True
         
-        # 如果Firecrawl失败，尝试newspaper3k备用方案
+        # 使用增强的newspaper3k备用方案
         try:
-            print(f"🔄 尝试newspaper3k备用方案 (尝试 {attempt + 1}/{max_retries}): {url}")
+            print(f"🔄 尝试增强newspaper3k备用方案 (尝试 {attempt + 1}/{max_retries}): {url}")
             
-            # 先检查URL状态
-            response = requests.get(url, timeout=15, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            })
+            # 创建会话保持连接
+            session = requests.Session()
+            headers = get_site_specific_headers(url)
+            
+            # 添加随机延迟
+            import random
+            delay = random.uniform(1, 3)
+            time.sleep(delay)
+            
+            # 多步骤请求模拟真实用户行为
+            try:
+                # 第一步：访问主页建立会话
+                if 'wallstreetcn.com' in url:
+                    session.get('https://wallstreetcn.com/', headers=headers, timeout=10)
+                elif '36kr.com' in url:
+                    session.get('https://36kr.com/', headers=headers, timeout=10)
+                elif 'eastmoney.com' in url:
+                    session.get('http://www.eastmoney.com/', headers=headers, timeout=10)
+                elif 'hket.com' in url:
+                    session.get('https://china.hket.com/', headers=headers, timeout=10)
+                
+                time.sleep(random.uniform(0.5, 1.5))
+            except:
+                pass  # 忽略主页访问失败
+            
+            # 第二步：访问目标页面
+            response = session.get(url, timeout=25, headers=headers, allow_redirects=True)
             
             # 检查HTTP状态码
             if response.status_code in PERMANENT_ERROR_CODES:
                 print(f"❌ 备用方案遇到永久错误状态码 {response.status_code}: {url}")
+                session.close()
                 break
             elif response.status_code in RETRY_STATUS_CODES:
                 print(f"⚠️ 备用方案遇到临时错误状态码 {response.status_code}: {url}")
+                session.close()
                 continue
+            elif response.status_code in ANTI_CRAWLER_CODES:
+                print(f"⚠️ 备用方案遇到反爬状态码 {response.status_code}: {url}，尝试解析内容")
+                # 即使是403/404也尝试解析，可能是反爬但内容可用
             elif response.status_code != 200:
                 print(f"⚠️ 备用方案遇到HTTP错误 {response.status_code}: {url}")
+                session.close()
                 continue
             
+            # 使用newspaper3k解析
             article = Article(url)
-            article.config.headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
-            article.config.request_timeout = 15
+            article.config.headers = headers
+            article.config.request_timeout = 25
+            article.config.browser_user_agent = headers['User-Agent']
+            article.config.follow_meta_refresh = True
+            article.config.fetch_images = False
             
-            article.download()
+            # 直接使用已获取的响应内容
+            article.set_html(response.text)
             article.parse()
             
-            text = article.text[:1500]
+            text = article.text[:1500] if article.text else ""
+            
+            # 如果newspaper3k解析失败，尝试简单的HTML解析
+            if not text or len(text.strip()) < 50:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # 移除脚本和样式
+                for script in soup(["script", "style"]):
+                    script.decompose()
+                
+                # 尝试提取主要内容
+                content_selectors = [
+                    'article', '.article-content', '.content', '.post-content',
+                    '.entry-content', '.main-content', '#content', '.article-body',
+                    '.news-content', '.text-content', '.article-text'
+                ]
+                
+                for selector in content_selectors:
+                    content_elem = soup.select_one(selector)
+                    if content_elem:
+                        text = content_elem.get_text(strip=True)[:1500]
+                        if len(text.strip()) >= 50:
+                            break
+                
+                # 如果还是没有内容，提取所有文本
+                if not text or len(text.strip()) < 50:
+                    text = soup.get_text(strip=True)[:1500]
+            
+            session.close()
             
             # 检查是否为错误页面内容
-            if is_error_page_content(text):
+            if is_error_page_content(text, url):
                 print(f"⚠️ 备用方案获取到错误页面内容: {url}")
                 continue
             
@@ -219,14 +435,15 @@ def fetch_article_text(url, max_retries=3):
             else:
                 print(f"⚠️ 备用方案获取的内容为空或过短: {url}")
                 
-        except requests.exceptions.HTTPError as http_e:
-            if "404" in str(http_e):
-                print(f"❌ 备用方案遇到404错误: {url}")
-                break
-            else:
-                print(f"⚠️ 备用方案HTTP错误: {url}，错误: {http_e}")
+        except requests.exceptions.Timeout:
+            print(f"⚠️ 备用方案请求超时: {url}")
+            continue
+        except requests.exceptions.RequestException as req_e:
+            print(f"⚠️ 备用方案网络错误: {url}，错误: {req_e}")
+            continue
         except Exception as backup_e:
             print(f"⚠️ 备用方案异常: {url}，错误: {backup_e}")
+            continue
     
     print(f"❌ 所有尝试均失败，无法获取文章内容: {url}")
     return "（未能获取文章正文）"
