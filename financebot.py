@@ -525,29 +525,181 @@ def summarize(text):
     )
     return completion.choices[0].message.content.strip()
 
-# 发送企业微信机器人推送
+# 发送企业微信机器人推送（支持4096字符限制的智能分割）
 def send_to_wechat(title, content):
-    # 企业微信机器人消息格式
-    message = f"**{title}**\n\n{content}"
-    data = {
-        "msgtype": "markdown",
-        "markdown": {
-            "content": message
-        }
-    }
+    """发送企业微信消息，自动处理4096字符限制
     
-    try:
-        response = requests.post(wechat_webhook_url, json=data, timeout=10)
-        if response.ok:
-            result = response.json()
-            if result.get("errcode") == 0:
-                print("✅ 企业微信推送成功")
+    Args:
+        title: 消息标题
+        content: 消息内容
+    
+    Returns:
+        bool: 是否全部发送成功
+    """
+    
+    def smart_split_message(message, max_length=3900):  # 留更多余量给序号标识
+        """智能分割消息，优先在段落和句子边界分割"""
+        if len(message) <= max_length:
+            return [message]
+        
+        chunks = []
+        current_chunk = ""
+        
+        # 按段落分割（双换行）
+        paragraphs = message.split('\n\n')
+        
+        for paragraph in paragraphs:
+            # 如果单个段落就超过限制，需要进一步分割
+            if len(paragraph) > max_length:
+                # 按句子分割
+                sentences = re.split(r'([。！？\n])', paragraph)
+                temp_paragraph = ""
+                
+                for i in range(0, len(sentences), 2):
+                    sentence = sentences[i] + (sentences[i+1] if i+1 < len(sentences) else "")
+                    
+                    if len(current_chunk + temp_paragraph + sentence) > max_length:
+                        if current_chunk:
+                            chunks.append(current_chunk.strip())
+                            current_chunk = ""
+                        if temp_paragraph:
+                            chunks.append(temp_paragraph.strip())
+                            temp_paragraph = ""
+                        
+                        # 如果单个句子还是太长，强制分割
+                        if len(sentence) > max_length:
+                            while len(sentence) > max_length:
+                                chunks.append(sentence[:max_length].strip())
+                                sentence = sentence[max_length:]
+                            if sentence.strip():
+                                temp_paragraph = sentence
+                        else:
+                            temp_paragraph = sentence
+                    else:
+                        temp_paragraph += sentence
+                
+                if temp_paragraph:
+                    if len(current_chunk + "\n\n" + temp_paragraph) > max_length:
+                        if current_chunk:
+                            chunks.append(current_chunk.strip())
+                            current_chunk = temp_paragraph
+                        else:
+                            chunks.append(temp_paragraph.strip())
+                    else:
+                        current_chunk += ("\n\n" if current_chunk else "") + temp_paragraph
             else:
-                print(f"❌ 企业微信推送失败: {result.get('errmsg', '未知错误')}")
+                # 检查是否可以添加到当前块
+                test_chunk = current_chunk + ("\n\n" if current_chunk else "") + paragraph
+                if len(test_chunk) > max_length:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = paragraph
+                else:
+                    current_chunk = test_chunk
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+    
+    def send_single_message(message_content, part_info=""):
+        """发送单条消息"""
+        data = {
+            "msgtype": "markdown",
+            "markdown": {
+                "content": message_content
+            }
+        }
+        
+        try:
+            response = requests.post(wechat_webhook_url, json=data, timeout=15)
+            if response.ok:
+                result = response.json()
+                if result.get("errcode") == 0:
+                    print(f"✅ 企业微信推送成功{part_info}")
+                    return True
+                else:
+                    print(f"❌ 企业微信推送失败{part_info}: {result.get('errmsg', '未知错误')}")
+                    return False
+            else:
+                print(f"❌ 企业微信推送失败{part_info}，HTTP状态码: {response.status_code}")
+                return False
+        except Exception as e:
+            print(f"❌ 企业微信推送异常{part_info}: {e}")
+            return False
+    
+    # 构建完整消息
+    full_message = f"**{title}**\n\n{content}"
+    
+    # 检查是否需要分割（企业微信严格限制4096字符）
+    if len(full_message) < 4096:
+        return send_single_message(full_message)
+    
+    print(f"📝 消息长度 {len(full_message)} 字符，超过4096限制，开始智能分割")
+    
+    # 分割消息
+    message_chunks = smart_split_message(full_message)
+    total_chunks = len(message_chunks)
+    
+    print(f"📋 消息已分割为 {total_chunks} 部分")
+    
+    success_count = 0
+    
+    for i, chunk in enumerate(message_chunks, 1):
+        # 添加序号标识
+        if total_chunks > 1:
+            part_indicator = f"\n\n---\n📄 **第 {i}/{total_chunks} 部分**"
+            if i == 1:
+                # 第一部分保持原标题
+                message_with_indicator = chunk + part_indicator
+            else:
+                # 后续部分添加续篇标识
+                continuation_title = f"**{title}（续 {i}/{total_chunks}）**\n\n"
+                chunk_content = chunk.replace(f"**{title}**\n\n", "")
+                message_with_indicator = continuation_title + chunk_content + part_indicator
         else:
-            print(f"❌ 企业微信推送失败，HTTP状态码: {response.status_code}")
-    except Exception as e:
-        print(f"❌ 企业微信推送异常: {e}")
+            message_with_indicator = chunk
+        
+        # 确保最终消息不超过4096字符
+        if len(message_with_indicator) >= 4096:
+            # 如果添加标识后超长，需要进一步截断内容
+            available_length = 4095 - len(part_indicator) - (len(continuation_title) if total_chunks > 1 and i > 1 else 0)
+            if i == 1:
+                available_length -= len(f"**{title}**\n\n")
+            
+            if available_length > 100:  # 确保有足够内容
+                if i == 1:
+                    truncated_content = chunk[:available_length] + "..."
+                    message_with_indicator = truncated_content + part_indicator
+                else:
+                    truncated_content = chunk_content[:available_length] + "..."
+                    message_with_indicator = continuation_title + truncated_content + part_indicator
+            else:
+                print(f"⚠️ 第 {i} 部分内容过长，无法添加完整标识")
+                message_with_indicator = chunk[:4095]
+        
+        # 发送消息
+        part_info = f" (第 {i}/{total_chunks} 部分)" if total_chunks > 1 else ""
+        success = send_single_message(message_with_indicator, part_info)
+        
+        if success:
+            success_count += 1
+        else:
+            print(f"⚠️ 第 {i} 部分发送失败，继续发送后续部分")
+        
+        # 在消息之间添加延迟避免频率限制
+        if i < total_chunks:
+            delay_time = 2 if total_chunks <= 3 else 3  # 根据分割数量调整延迟
+            print(f"⏳ 等待 {delay_time} 秒后发送下一部分...")
+            time.sleep(delay_time)
+    
+    # 发送结果统计
+    if success_count == total_chunks:
+        print(f"🎉 所有 {total_chunks} 部分消息发送成功")
+        return True
+    else:
+        print(f"⚠️ {total_chunks} 部分消息中有 {total_chunks - success_count} 部分发送失败")
+        return False
 
 
 if __name__ == "__main__":
