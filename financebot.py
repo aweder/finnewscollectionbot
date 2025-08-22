@@ -10,11 +10,10 @@ import os
 
 # OpenAI API Key
 openai_api_key = os.getenv("OPENAI_API_KEY")
-# 从环境变量获取 Server酱 SendKeys
-server_chan_keys_env = os.getenv("SERVER_CHAN_KEYS")
-if not server_chan_keys_env:
-    raise ValueError("环境变量 SERVER_CHAN_KEYS 未设置，请在Github Actions中设置此变量！")
-server_chan_keys = server_chan_keys_env.split(",")
+# 从环境变量获取企业微信机器人 Webhook URL
+wechat_webhook_url = os.getenv("WECHAT_WEBHOOK_URL")
+if not wechat_webhook_url:
+    raise ValueError("环境变量 WECHAT_WEBHOOK_URL 未设置，请在Github Actions中设置此变量！")
 
 openai_client = OpenAI(api_key=openai_api_key, base_url="https://api.deepseek.com/v1")
 
@@ -142,16 +141,29 @@ def summarize(text):
     )
     return completion.choices[0].message.content.strip()
 
-# 发送微信推送
+# 发送企业微信机器人推送
 def send_to_wechat(title, content):
-    for key in server_chan_keys:
-        url = f"https://sctapi.ftqq.com/{key}.send"
-        data = {"title": title, "desp": content}
-        response = requests.post(url, data=data, timeout=10)
+    # 企业微信机器人消息格式
+    message = f"**{title}**\n\n{content}"
+    data = {
+        "msgtype": "markdown",
+        "markdown": {
+            "content": message
+        }
+    }
+    
+    try:
+        response = requests.post(wechat_webhook_url, json=data, timeout=10)
         if response.ok:
-            print(f"✅ 推送成功: {key}")
+            result = response.json()
+            if result.get("errcode") == 0:
+                print("✅ 企业微信推送成功")
+            else:
+                print(f"❌ 企业微信推送失败: {result.get('errmsg', '未知错误')}")
         else:
-            print(f"❌ 推送失败: {key}, 响应：{response.text}")
+            print(f"❌ 企业微信推送失败，HTTP状态码: {response.status_code}")
+    except Exception as e:
+        print(f"❌ 企业微信推送异常: {e}")
 
 
 if __name__ == "__main__":
@@ -169,5 +181,5 @@ if __name__ == "__main__":
         if content.strip():
             final_summary += f"## {category}\n{content}\n\n"
 
-    # 推送到多个server酱key
+    # 推送到企业微信机器人
     send_to_wechat(title=f"📌 {today_str} 财经新闻摘要", content=final_summary)
